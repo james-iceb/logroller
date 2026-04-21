@@ -44,8 +44,11 @@
 //!    Ok(())
 //! }
 //! ```
+mod thread_pool;
+
 use {
     chrono::{DateTime, FixedOffset, Local, NaiveTime, Timelike, Utc},
+    crossbeam_channel::{bounded, Receiver},
     flate2::write::GzEncoder,
     regex::Regex,
     std::{
@@ -53,8 +56,7 @@ use {
         fs::{self, DirEntry, Permissions},
         io::{self, Write as _},
         path::{Path, PathBuf},
-        sync::{PoisonError, RwLock},
-        thread::JoinHandle,
+        sync::{LazyLock, PoisonError, RwLock},
     },
 };
 
@@ -63,6 +65,15 @@ use xz2::write::XzEncoder;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+static GLOBAL_THREAD_POOL: LazyLock<io::Result<thread_pool::ThreadPool>> = LazyLock::new(|| {
+    thread_pool::ThreadPool::new(
+        std::env::var("LOGROLLER_THREAD_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4),
+    )
+});
 
 /// Defines size thresholds for rotating log files in various units.
 ///
@@ -359,7 +370,7 @@ pub struct LogRoller {
     meta: LogRollerMeta,
     state: LogRollerState,
     writer: RwLock<fs::File>,
-    compressing_handle: Option<JoinHandle<()>>,
+    pending_compression: Option<Receiver<()>>,
 }
 
 impl LogRoller {
@@ -688,11 +699,35 @@ impl LogRollerMeta {
         new_log_path: PathBuf,
         next_size_based_index: usize,
         compression: &Option<Compression>,
-    ) -> Result<JoinHandle<()>, LogRollerError> {
+    ) -> Result<Receiver<()>, LogRollerError> {
         let meta = self.to_owned();
-        let handle = match &self.rotation {
+        let pool = GLOBAL_THREAD_POOL.as_ref().map_err(|err| {
+            LogRollerError::InternalError(format!("Failed to initialize rotation worker pool: {err}"))
+        })?;
+        let done_rx = match &self.rotation {
             Rotation::SizeBased(_) => {
                 let curr_log_path = self.directory.join(&self.filename);
+                let queued_log_path = new_log_path.clone();
+                let (start_tx, start_rx) = bounded::<()>(1);
+                let done_rx = pool
+                    .submit(move || {
+                        if start_rx.recv().is_err() {
+                            return;
+                        }
+                        if let Err(err) = meta.process_old_logs(&queued_log_path) {
+                            eprintln!(
+                                "Failed to process old log files for '{}': {}",
+                                queued_log_path.display(),
+                                err
+                            );
+                        }
+                    })
+                    .map_err(|err| match err {
+                        thread_pool::SubmitError::QueueFull => LogRollerError::RotationQueueFull,
+                        thread_pool::SubmitError::Disconnected => LogRollerError::InternalError(
+                            "Failed to submit rotation task: worker pool disconnected".to_string(),
+                        ),
+                    })?;
 
                 // 1. Rename the existing log files.
                 // If target file exists, it will be overwritten
@@ -761,18 +796,33 @@ impl LogRollerMeta {
                 }
                 *writer = new_log_file;
 
-                // 5. Process old logs in a separate thread (sequentially)
-                std::thread::spawn(move || {
-                    if let Err(err) = meta.process_old_logs(&new_log_path) {
-                        eprintln!(
-                            "Failed to process old log files for '{}': {}",
-                            new_log_path.display(),
-                            err
-                        );
-                    }
-                })
+                // 5. Start queued old-log processing after rollover is complete.
+                let _ = start_tx.send(());
+                done_rx
             }
             Rotation::AgeBased(_) => {
+                let queued_log_path = old_log_path.clone();
+                let (start_tx, start_rx) = bounded::<()>(1);
+                let done_rx = pool
+                    .submit(move || {
+                        if start_rx.recv().is_err() {
+                            return;
+                        }
+                        if let Err(err) = meta.process_old_logs(&queued_log_path) {
+                            eprintln!(
+                                "Failed to process old log files for '{}': {}",
+                                queued_log_path.display(),
+                                err
+                            );
+                        }
+                    })
+                    .map_err(|err| match err {
+                        thread_pool::SubmitError::QueueFull => LogRollerError::RotationQueueFull,
+                        thread_pool::SubmitError::Disconnected => LogRollerError::InternalError(
+                            "Failed to submit rotation task: worker pool disconnected".to_string(),
+                        ),
+                    })?;
+
                 // 1. Create the new log file first
                 let new_log_file = match self.create_log_file(&new_log_path) {
                     Ok(file) => file,
@@ -792,19 +842,12 @@ impl LogRollerMeta {
                 // 3. Update writer with new file only after successful flush
                 *writer = new_log_file;
 
-                // 4. Process old logs in a separate thread (sequentially)
-                std::thread::spawn(move || {
-                    if let Err(err) = meta.process_old_logs(&old_log_path) {
-                        eprintln!(
-                            "Failed to process old log files for '{}': {}",
-                            old_log_path.display(),
-                            err
-                        );
-                    }
-                })
+                // 4. Start queued old-log processing after rollover is complete.
+                let _ = start_tx.send(());
+                done_rx
             }
         };
-        Ok(handle)
+        Ok(done_rx)
     }
 }
 
@@ -881,6 +924,8 @@ pub enum LogRollerError {
     ShouldNotRotate(PathBuf),
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Rotation task queue is full")]
+    RotationQueueFull,
     #[error("Failed to set file permissions for '{path}': {error}")]
     SetFilePermissionsError { path: PathBuf, error: String },
     #[cfg(feature = "xz")]
@@ -1080,7 +1125,7 @@ impl LogRollerBuilder {
                 ),
             },
             writer: RwLock::new(self.meta.create_log_file(&curr_file_path)?),
-            compressing_handle: None,
+            pending_compression: None,
         })
     }
 }
@@ -1098,27 +1143,38 @@ impl io::Write for LogRoller {
         let bytes = writer.write(buf)?;
         self.state.curr_file_size_bytes += bytes as u64;
 
-        // Check if compression thread still running. if it is, store log into previos
-        // buffer first.
-        if let Some(handle) = &self.compressing_handle {
-            if !handle.is_finished() {
+        // Check if a previous rotation's compression is still running; if so skip this
+        // rotation.
+        if let Some(rx) = &self.pending_compression {
+            if matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)) {
                 return Ok(bytes);
             }
-        };
+        }
 
         // Check if we need to rollover the log file
         if let Some(new_log_path) = Self::should_rollover(&self.meta, &self.state) {
-            let handle = self
-                .meta
-                .refresh_writer(
-                    writer,
-                    old_log_path,
-                    new_log_path.to_owned(),
-                    next_size_based_index,
-                    &compression,
+            let pool = GLOBAL_THREAD_POOL.as_ref().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to initialize rotation worker pool: {err}"),
                 )
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-            self.compressing_handle = Some(handle);
+            })?;
+            if !pool.has_capacity() {
+                return Ok(bytes);
+            }
+
+            let done_rx = match self.meta.refresh_writer(
+                writer,
+                old_log_path,
+                new_log_path.to_owned(),
+                next_size_based_index,
+                &compression,
+            ) {
+                Ok(rx) => rx,
+                Err(LogRollerError::RotationQueueFull) => return Ok(bytes),
+                Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err.to_string())),
+            };
+            self.pending_compression = Some(done_rx);
             self.state.curr_file_path.clone_from(&new_log_path);
 
             match &self.meta.rotation {
@@ -1146,13 +1202,13 @@ impl io::Write for LogRoller {
     fn flush(&mut self) -> io::Result<()> {
         self.writer.get_mut().unwrap_or_else(PoisonError::into_inner).flush()?;
 
-        // Skips waiting for thread to finish if graceful_shutdown == false
+        // Skips waiting for compression to finish if graceful_shutdown == false
         if !self.meta.graceful_shutdown {
             return Ok(());
         }
 
-        if let Some(handle) = self.compressing_handle.take() {
-            let _ = handle.join();
+        if let Some(rx) = self.pending_compression.take() {
+            let _ = rx.recv();
         }
         Ok(())
     }
